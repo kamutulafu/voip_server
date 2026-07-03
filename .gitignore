@@ -1,0 +1,9 @@
+*.log
+*.pcm
+*.h264
+*.h265
+*.opus
+voipcloud_demo*
+__pycache__/
+*.bak*
+D510*

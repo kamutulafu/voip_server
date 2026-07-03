@@ -1,0 +1,1 @@
+clang audio_impl.c camera_impl.c cloudvoip_server.c crypto_openssl.c h264.c help.c sps.c video_impl.c -I ../../server/D5100032/include -L ../../server/D5100032/lib/ -lcrypto -lpthread -lwxcloudvoip_server -lm -o voipcloud_demo
