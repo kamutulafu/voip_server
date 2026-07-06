@@ -319,55 +319,87 @@ static void* thread_camera(void* data) {
       uint8_t pps_nal[1024];
       int pps_len = 0;
       int sent_sps_pps = 0;
+      int sent_idr = 0;
       
       while (!thread_exit) {
-        uint32_t nal_len = 0;
-        if (recv(conn, &nal_len, 4, MSG_WAITALL) != 4) break;
-        if (nal_len > sizeof(buffer) || nal_len == 0) break;
-        if (recv(conn, buffer, nal_len, MSG_WAITALL) != nal_len) break;
+        uint32_t payload_len = 0;
+        if (recv(conn, &payload_len, 4, MSG_WAITALL) != 4) break;
+        if (payload_len > sizeof(buffer) || payload_len == 0) break;
+        if (recv(conn, buffer, payload_len, MSG_WAITALL) != payload_len) break;
 
-        // Determine NAL type (assuming 00 00 00 01 or 00 00 01 start code)
-        uint8_t nal_type = 0;
-        if (nal_len >= 4 && buffer[0] == 0 && buffer[1] == 0 && buffer[2] == 0 && buffer[3] == 1) {
-            nal_type = buffer[4] & 0x1F;
-        } else if (nal_len >= 3 && buffer[0] == 0 && buffer[1] == 0 && buffer[2] == 1) {
-            nal_type = buffer[3] & 0x1F;
-        }
+        uint8_t *p = buffer;
+        uint32_t remain = payload_len;
         
-        if (nal_type == 7) { // SPS
-            if (nal_len <= sizeof(sps_nal)) {
-                memcpy(sps_nal, buffer, nal_len);
-                sps_len = nal_len;
+        while (remain > 3) {
+            int start_len = 0;
+            if (p[0] == 0 && p[1] == 0 && p[2] == 1) start_len = 3;
+            else if (remain >= 4 && p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1) start_len = 4;
+            
+            if (start_len == 0) {
+                p++; remain--;
+                continue;
             }
-        } else if (nal_type == 8) { // PPS
-            if (nal_len <= sizeof(pps_nal)) {
-                memcpy(pps_nal, buffer, nal_len);
+            
+            uint8_t *next_p = p + start_len;
+            uint32_t next_remain = remain - start_len;
+            uint32_t nal_len = start_len;
+            
+            while (next_remain > 3) {
+                if ((next_p[0] == 0 && next_p[1] == 0 && next_p[2] == 1) ||
+                    (next_remain >= 4 && next_p[0] == 0 && next_p[1] == 0 && next_p[2] == 0 && next_p[3] == 1)) {
+                    break;
+                }
+                next_p++; next_remain--; nal_len++;
+            }
+            if (next_remain <= 3) {
+                nal_len += next_remain;
+            }
+            
+            uint8_t nal_type = p[start_len] & 0x1F;
+            
+            if (nal_type == 7 && nal_len <= sizeof(sps_nal)) {
+                memcpy(sps_nal, p, nal_len);
+                sps_len = nal_len;
+            } else if (nal_type == 8 && nal_len <= sizeof(pps_nal)) {
+                memcpy(pps_nal, p, nal_len);
                 pps_len = nal_len;
             }
-        }
-
-        if (voip_status == WX_CLOUDVOIP_SESSION_TALKING) {
-          pthread_mutex_lock(&camera_mutex);
-          
-          struct listnode* node;
-          list_for_each(node, &camera_stream_list) {
-            CAMERA_STREAM* stream = node_to_item(node, CAMERA_STREAM, slist);
-            if (stream->config.format == WX_VIDEO_FORMAT_H264) {
-              struct timespec ts = {0};
-              
-              // If it's an I-frame (type 5) and we haven't successfully injected SPS/PPS since TALKING started, inject now
-              if (nal_type == 5 && !sent_sps_pps && sps_len > 0 && pps_len > 0) {
-                  stream->listener->data(stream->stream, stream->user_data, sps_nal, sps_len, 0, 0, WX_VIDEO_ROTATION_0, ts);
-                  stream->listener->data(stream->stream, stream->user_data, pps_nal, pps_len, 0, 0, WX_VIDEO_ROTATION_0, ts);
-                  sent_sps_pps = 1;
-              }
-              
-              stream->listener->data(stream->stream, stream->user_data, buffer, nal_len, 0, 0, WX_VIDEO_ROTATION_0, ts);
+            
+            if (voip_status == WX_CLOUDVOIP_SESSION_TALKING) {
+                pthread_mutex_lock(&camera_mutex);
+                struct listnode* node;
+                list_for_each(node, &camera_stream_list) {
+                    CAMERA_STREAM* stream = node_to_item(node, CAMERA_STREAM, slist);
+                    if (stream->config.format == WX_VIDEO_FORMAT_H264) {
+                        struct timespec ts = {0};
+                        
+                        if (nal_type == 5) {
+                            if (!sent_sps_pps && sps_len > 0 && pps_len > 0) {
+                                stream->listener->data(stream->stream, stream->user_data, sps_nal, sps_len, 0, 0, WX_VIDEO_ROTATION_0, ts);
+                                stream->listener->data(stream->stream, stream->user_data, pps_nal, pps_len, 0, 0, WX_VIDEO_ROTATION_0, ts);
+                                sent_sps_pps = 1;
+                            }
+                            stream->listener->data(stream->stream, stream->user_data, p, nal_len, 0, 0, WX_VIDEO_ROTATION_0, ts);
+                            sent_idr = 1;
+                        } 
+                        else if (nal_type == 1) {
+                            if (sent_idr) {
+                                stream->listener->data(stream->stream, stream->user_data, p, nal_len, 0, 0, WX_VIDEO_ROTATION_0, ts);
+                            }
+                        }
+                        else if (nal_type == 7 || nal_type == 8) {
+                             stream->listener->data(stream->stream, stream->user_data, p, nal_len, 0, 0, WX_VIDEO_ROTATION_0, ts);
+                        }
+                    }
+                }
+                pthread_mutex_unlock(&camera_mutex);
+            } else {
+                sent_sps_pps = 0;
+                sent_idr = 0;
             }
-          }
-          pthread_mutex_unlock(&camera_mutex);
-        } else {
-            sent_sps_pps = 0; // Reset so we inject again when TALKING starts
+            
+            p += nal_len;
+            remain -= nal_len;
         }
       }
       close(conn);
