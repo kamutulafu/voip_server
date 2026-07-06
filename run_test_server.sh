@@ -18,7 +18,7 @@ echo "PAYLOAD: $PAYLOAD"
 echo "SERVER TOKEN: $SERVER_TOKEN"
 
 # Execute the demo with matching parameters
-LD_LIBRARY_PATH=../../server/D5100032/lib/ ./voipcloud_demo \
+LD_LIBRARY_PATH=D5100032/wxcloudvoipsdk-server-0xD5100032-linux-x64-release/lib/ ./voipcloud_demo \
 	--appid wx769bf6a5775ba85e \
 	--device_id RD2600000001 \
 	--model_id YiROQwsClOLubDM-ej_isQ \

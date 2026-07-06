@@ -9,37 +9,51 @@ def _maybe_stats():
     if now - _stats['t'] >= 2.0:
         print("[STATS] audio %dpkt/%dB | video %dnal/%dB maxNAL=%dB drop=%d" % (_stats['a'], _stats['ab'], _stats['v'], _stats['vb'], _stats['vmax'], _stats['vdrop']), flush=True)
         _stats['t'] = now
-def _fwd_audio(sock, payload, addr):
-    try:
-        sock.sendto(payload, addr)
-        _stats['a'] += 1; _stats['ab'] += len(payload)
-    except Exception as e:
-        print("[-] audio UDP send fail: %s" % e, flush=True)
+audio_out_buffer = bytearray()
+
+def _fwd_audio(udp_sock, payload, addr):
+    global audio_out_buffer
+    audio_out_buffer.extend(payload)
+    
+    # WeChat SDK 16000Hz mono requires exactly 320 frames (640 bytes) per listener->data() call
+    while len(audio_out_buffer) >= 640:
+        chunk = audio_out_buffer[:640]
+        del audio_out_buffer[:640]
+        try:
+            udp_sock.sendto(chunk, addr)
+            _stats['a'] += 1; _stats['ab'] += 640
+        except Exception as e:
+            print("[-] audio UDP send fail: %s" % e, flush=True)
     _maybe_stats()
-def _fwd_video(sock, nal, addr):
+def _fwd_video(tcp_sock, nal):
     n = len(nal)
-    if n == 0:
-        return
-    if n > 65000:
-        _stats['vdrop'] += 1
-        print("[!] video NAL too big %dB, skipped" % n, flush=True)
-        _maybe_stats()
+    if n == 0 or tcp_sock is None:
         return
     try:
-        sock.sendto(nal, addr)
+        # Send 4-byte length header followed by NAL
+        tcp_sock.sendall(n.to_bytes(4, 'little') + nal)
         _stats['v'] += 1; _stats['vb'] += n
         if n > _stats['vmax']: _stats['vmax'] = n
     except Exception as e:
-        print("[-] video UDP send fail %dB: %s" % (n, e), flush=True)
+        print("[-] video TCP send fail %dB: %s" % (n, e), flush=True)
     _maybe_stats()
 
 
-def handle_client(conn, addr, udp_sock, video_udp_addr, audio_udp_addr):
+def handle_client(conn, addr, udp_sock, audio_udp_addr):
     print(f"[+] Client connected from {addr}")
     video_buffer = bytearray()
     first_audio = True
     first_video = True
     
+    # Establish TCP connection to local C server for video
+    video_tcp_sock = None
+    try:
+        video_tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        video_tcp_sock.connect(('127.0.0.1', 9002))
+    except Exception as e:
+        print(f"[-] Could not connect to local video TCP 9002 (C server might not be running yet): {e}")
+        video_tcp_sock = None
+        
     try:
         # Peek at the first 5 bytes to determine if it's HTTP or raw TCP
         peek_bytes = conn.recv(5, socket.MSG_PEEK)
@@ -120,21 +134,11 @@ def handle_client(conn, addr, udp_sock, video_udp_addr, audio_udp_addr):
                         if first_video:
                             print("[+] Successfully received first video packet via HTTP!")
                             first_video = False
-                        # Extract and forward H.264 NAL units
-                        video_buffer.extend(payload)
-                        while True:
-                            idx = video_buffer.find(b'\x00\x00\x01', 1)
-                            if idx == -1:
-                                break
-                            nal_end = idx
-                            if idx > 0 and video_buffer[idx-1] == 0:
-                                nal_end = idx - 1
-                            nal = video_buffer[:nal_end]
+                        if len(payload) > 0:
                             try:
-                                _fwd_video(udp_sock, nal, video_udp_addr)
+                                _fwd_video(video_tcp_sock, payload)
                             except Exception as e:
-                                print(f"[-] Failed to send video UDP: {e}")
-                            video_buffer = video_buffer[idx:]
+                                pass
                     
                     del buffer[:5+m_len]
             
@@ -184,20 +188,12 @@ def handle_client(conn, addr, udp_sock, video_udp_addr, audio_udp_addr):
                     if first_video:
                         print("[+] Successfully received first video packet via raw TCP!")
                         first_video = False
-                    video_buffer.extend(payload)
-                    while True:
-                        idx = video_buffer.find(b'\x00\x00\x01', 1)
-                        if idx == -1:
-                            break
-                        nal_end = idx
-                        if idx > 0 and video_buffer[idx-1] == 0:
-                            nal_end = idx - 1
-                        nal = video_buffer[:nal_end]
+                    
+                    if len(payload) > 0:
                         try:
-                            _fwd_video(udp_sock, nal, video_udp_addr)
+                            _fwd_video(video_tcp_sock, payload)
                         except Exception as e:
-                            print(f"[-] Failed to send raw video UDP: {e}")
-                        video_buffer = video_buffer[idx:]
+                            pass
                         
     except Exception as e:
         print(f"[-] Error handling client: {e}")
@@ -206,9 +202,11 @@ def handle_client(conn, addr, udp_sock, video_udp_addr, audio_udp_addr):
         # Send remaining video buffer
         if len(video_buffer) > 0:
             try:
-                udp_sock.sendto(video_buffer, video_udp_addr)
+                _fwd_video(video_tcp_sock, video_buffer)
             except:
                 pass
+        if video_tcp_sock:
+            video_tcp_sock.close()
         print(f"[-] Client {addr} disconnected.")
 
 def main():
@@ -226,14 +224,13 @@ def main():
 
     # UDP socket for sending to C program (voipcloud_demo)
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    video_udp_addr = ('127.0.0.1', 9002)
     audio_udp_addr = ('127.0.0.1', 9003)
 
     try:
         while True:
             conn, addr = tcp_server.accept()
             # Handle client in a thread to allow multiple concurrent requests or keep-alive
-            t = threading.Thread(target=handle_client, args=(conn, addr, udp_sock, video_udp_addr, audio_udp_addr))
+            t = threading.Thread(target=handle_client, args=(conn, addr, udp_sock, audio_udp_addr))
             t.daemon = True
             t.start()
     except KeyboardInterrupt:

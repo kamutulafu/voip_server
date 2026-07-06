@@ -44,7 +44,7 @@ static wx_error_t camera_device_getparameter(
     const struct wx_metadata* metadata,
     uint32_t key,
     struct wx_metadata_entry* value_out) {
-  uint32_t size[2] = {640, 480};
+  uint32_t size[2] = {800, 640};
 
   if (!value_out) {
     return WXERROR_INVALID_ARGUMENT;
@@ -277,9 +277,9 @@ int h264_readnalu(uint8_t* p, size_t* size, int* type);
 static uint8_t buffer[10 * 1024 * 1024];
 
 static void* thread_camera(void* data) {
-  int video_fd = socket(AF_INET, SOCK_DGRAM, 0);
-  if (video_fd < 0) {
-    printf("Create video UDP socket failed\n");
+  int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (listen_fd < 0) {
+    printf("Create video TCP socket failed\n");
     return NULL;
   }
 
@@ -289,47 +289,92 @@ static void* thread_camera(void* data) {
   addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
   int reuse = 1;
-  setsockopt(video_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+  setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
-  struct timeval tv;
-  tv.tv_sec = 0;
-  tv.tv_usec = 50000; // 50ms timeout
-  setsockopt(video_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-  if (bind(video_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-    printf("Bind video UDP socket to 9002 failed\n");
-    close(video_fd);
+  if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    printf("Bind video TCP socket to 9002 failed\n");
+    close(listen_fd);
     return NULL;
   }
 
-  printf("[*] Video UDP receiver thread started on 127.0.0.1:9002\n");
+  listen(listen_fd, 1);
+  printf("[*] Video TCP receiver thread started on 127.0.0.1:9002\n");
 
   while (!thread_exit) {
-    if (voip_status == WX_CLOUDVOIP_SESSION_TALKING) {
-      ssize_t sz = recvfrom(video_fd, buffer, sizeof(buffer), 0, NULL, NULL);
-      if (sz > 0) {
-        pthread_mutex_lock(&camera_mutex);
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 50000;
+    
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(listen_fd, &fds);
+    
+    int ret = select(listen_fd + 1, &fds, NULL, NULL, &tv);
+    if (ret > 0 && FD_ISSET(listen_fd, &fds)) {
+      int conn = accept(listen_fd, NULL, NULL);
+      if (conn < 0) continue;
+      
+      uint8_t sps_nal[1024];
+      int sps_len = 0;
+      uint8_t pps_nal[1024];
+      int pps_len = 0;
+      int sent_sps_pps = 0;
+      
+      while (!thread_exit) {
+        uint32_t nal_len = 0;
+        if (recv(conn, &nal_len, 4, MSG_WAITALL) != 4) break;
+        if (nal_len > sizeof(buffer) || nal_len == 0) break;
+        if (recv(conn, buffer, nal_len, MSG_WAITALL) != nal_len) break;
 
-        struct listnode* node;
-        list_for_each(node, &camera_stream_list) {
-          CAMERA_STREAM* stream = node_to_item(node, CAMERA_STREAM, slist);
-
-          if (stream->config.format == WX_VIDEO_FORMAT_H264) {
-            struct timespec ts = {0};
-            stream->listener->data(stream->stream, stream->user_data, buffer, sz,
-                                  0, 0, WX_VIDEO_ROTATION_0, ts);
-          }
+        // Determine NAL type (assuming 00 00 00 01 or 00 00 01 start code)
+        uint8_t nal_type = 0;
+        if (nal_len >= 4 && buffer[0] == 0 && buffer[1] == 0 && buffer[2] == 0 && buffer[3] == 1) {
+            nal_type = buffer[4] & 0x1F;
+        } else if (nal_len >= 3 && buffer[0] == 0 && buffer[1] == 0 && buffer[2] == 1) {
+            nal_type = buffer[3] & 0x1F;
+        }
+        
+        if (nal_type == 7) { // SPS
+            if (nal_len <= sizeof(sps_nal)) {
+                memcpy(sps_nal, buffer, nal_len);
+                sps_len = nal_len;
+            }
+        } else if (nal_type == 8) { // PPS
+            if (nal_len <= sizeof(pps_nal)) {
+                memcpy(pps_nal, buffer, nal_len);
+                pps_len = nal_len;
+            }
         }
 
-        pthread_mutex_unlock(&camera_mutex);
+        if (voip_status == WX_CLOUDVOIP_SESSION_TALKING) {
+          pthread_mutex_lock(&camera_mutex);
+          
+          struct listnode* node;
+          list_for_each(node, &camera_stream_list) {
+            CAMERA_STREAM* stream = node_to_item(node, CAMERA_STREAM, slist);
+            if (stream->config.format == WX_VIDEO_FORMAT_H264) {
+              struct timespec ts = {0};
+              
+              // If it's an I-frame (type 5) and we haven't successfully injected SPS/PPS since TALKING started, inject now
+              if (nal_type == 5 && !sent_sps_pps && sps_len > 0 && pps_len > 0) {
+                  stream->listener->data(stream->stream, stream->user_data, sps_nal, sps_len, 0, 0, WX_VIDEO_ROTATION_0, ts);
+                  stream->listener->data(stream->stream, stream->user_data, pps_nal, pps_len, 0, 0, WX_VIDEO_ROTATION_0, ts);
+                  sent_sps_pps = 1;
+              }
+              
+              stream->listener->data(stream->stream, stream->user_data, buffer, nal_len, 0, 0, WX_VIDEO_ROTATION_0, ts);
+            }
+          }
+          pthread_mutex_unlock(&camera_mutex);
+        } else {
+            sent_sps_pps = 0; // Reset so we inject again when TALKING starts
+        }
       }
-    }
-    else {
-      usleep(20000);
+      close(conn);
     }
   }
 
-  close(video_fd);
+  close(listen_fd);
   printf("thread_camera exit\n");
   return NULL;
 }

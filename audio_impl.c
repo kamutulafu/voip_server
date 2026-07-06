@@ -440,10 +440,9 @@ static void hal_play_buffer(uint8_t* buffer, size_t len) {
     receive_pcm_stream_ts = get_timestamp_us();
   }
 
-  if (voip_receive_video == 0) {
-    printf("receive audio, but not receive video~\n");
-    return;
-  }
+  /*
+   * (Removed hardcoded voip_receive_video check to allow audio-only calls)
+   */
 
   /* 测试视频滞后音频的时间 */
   if (video_delay_ms == 0) {

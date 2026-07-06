@@ -2,10 +2,22 @@
 import socket
 import subprocess
 import sys
+import os
+import signal
+import time
+
+def kill_existing_voip_processes():
+    """清理之前的僵尸进程，避免 UDP 9002/9003 端口被占用"""
+    print("[*] Cleaning up old voipcloud_demo instances...")
+    subprocess.run(["pkill", "-9", "-f", "voipcloud_demo"], stderr=subprocess.DEVNULL)
+    subprocess.run(["pkill", "-9", "-f", "run_test_server.sh"], stderr=subprocess.DEVNULL)
 
 def main():
     HOST = '0.0.0.0'
     PORT = 9001
+
+    # 启动前先清理环境
+    kill_existing_voip_processes()
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -19,9 +31,11 @@ def main():
     print(f"[*] Automation listener started. Listening on {HOST}:{PORT}...")
     print("[*] Waiting for server_token from ESP32...")
 
-    # Start the media receiver script in the background
+    # 在后台启动媒体流接收服务器
     print("[*] Starting media transcoder on port 8081...")
     transcoder_proc = subprocess.Popen(["python3", "-u", "media_recv_server.py"])
+
+    voip_proc = None
 
     try:
         while True:
@@ -34,43 +48,44 @@ def main():
                     continue
 
                 data = data_bytes.decode('utf-8', errors='ignore')
-                print(f"[+] Received raw data:\n{data}")
                 
                 token = None
                 payload = "payload"
 
-                # Check if it is an HTTP request
+                # 兼容 HTTP GET 模式和纯 TCP 模式
                 if "HTTP/" in data:
-                    # Parse HTTP headers
                     for line in data.split('\r\n'):
                         if line.lower().startswith("x-voip-token:"):
                             token = line.split(":", 1)[1].strip()
                         elif line.lower().startswith("x-voip-payload:"):
                             payload = line.split(":", 1)[1].strip()
                     
-                    # Respond with HTTP 200 OK to satisfy Nginx/Client
                     response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
                     conn.sendall(response.encode())
                 else:
-                    # Raw TCP data
                     data_clean = data.strip()
                     if "|" in data_clean:
                         token, payload = data_clean.split("|", 1)
                     else:
                         token = data_clean
 
-                # Validate token
-                if not token or len(token) < 20 or token.startswith("GET") or token.startswith("POST"):
-                    print(f"[-] Invalid token format or scanner detected. Ignoring.")
+                if not token or len(token) < 15 or token.startswith("GET") or token.startswith("POST"):
+                    print(f"[-] Invalid token format. Ignoring.")
                     continue
 
-                print(f"[+] Token: {token}")
-                print(f"[+] Payload: {payload}")
+                print(f"[+] 成功获取 Token: {token}")
+                print(f"[+] 成功获取 Payload: {payload}")
 
-                # Start the VoIP Server Demo
-                print("[*] Starting VoIP cloud server...")
-                proc = subprocess.Popen(["./run_test_server.sh", token, payload])
-                print(f"[+] Server started (PID: {proc.pid})")
+                # 【优化点】如果已经有正在通话的进程，先彻底杀死它，避免重复开启导致 9002/9003 端口冲突
+                if voip_proc and voip_proc.poll() is None:
+                    print("[*] Stopping previous VoIP session...")
+                    kill_existing_voip_processes()
+                    time.sleep(0.5)
+
+                # 启动最新的 VoIP 会话
+                print("[*] Starting new VoIP cloud server session...")
+                voip_proc = subprocess.Popen(["./run_test_server.sh", token, payload])
+                print(f"[+] Server started (PID: {voip_proc.pid})")
 
             except Exception as e:
                 print(f"[-] Error processing connection: {e}")
@@ -80,6 +95,7 @@ def main():
         print("\n[*] Exiting automation listener...")
     finally:
         server.close()
+        kill_existing_voip_processes()
         try:
             transcoder_proc.terminate()
             transcoder_proc.wait()
