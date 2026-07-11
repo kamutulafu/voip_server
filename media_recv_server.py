@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 import socket
 import sys
 import threading
@@ -28,7 +28,7 @@ def _fwd_audio(udp_sock, payload, addr):
 def _fwd_video(tcp_sock, nal):
     n = len(nal)
     if n == 0 or tcp_sock is None:
-        return
+        raise ConnectionError("Video TCP socket is closed")
     try:
         # Send 4-byte length header followed by NAL
         tcp_sock.sendall(n.to_bytes(4, 'little') + nal)
@@ -36,7 +36,9 @@ def _fwd_video(tcp_sock, nal):
         if n > _stats['vmax']: _stats['vmax'] = n
     except Exception as e:
         print("[-] video TCP send fail %dB: %s" % (n, e), flush=True)
+        raise e
     _maybe_stats()
+
 
 
 def handle_client(conn, addr, udp_sock, audio_udp_addr):
@@ -135,10 +137,7 @@ def handle_client(conn, addr, udp_sock, audio_udp_addr):
                             print("[+] Successfully received first video packet via HTTP!")
                             first_video = False
                         if len(payload) > 0:
-                            try:
-                                _fwd_video(video_tcp_sock, payload)
-                            except Exception as e:
-                                pass
+                            _fwd_video(video_tcp_sock, payload)
                     
                     del buffer[:5+m_len]
             
@@ -190,10 +189,7 @@ def handle_client(conn, addr, udp_sock, audio_udp_addr):
                         first_video = False
                     
                     if len(payload) > 0:
-                        try:
                             _fwd_video(video_tcp_sock, payload)
-                        except Exception as e:
-                            pass
                         
     except Exception as e:
         print(f"[-] Error handling client: {e}")
@@ -240,3 +236,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
