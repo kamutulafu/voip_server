@@ -27,16 +27,27 @@ def _fwd_audio(udp_sock, payload, addr):
     _maybe_stats()
 def _fwd_video(tcp_sock, nal):
     n = len(nal)
-    if n == 0 or tcp_sock is None:
-        raise ConnectionError("Video TCP socket is closed")
+    if n == 0:
+        return tcp_sock
+    
+    if tcp_sock is None:
+        try:
+            tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            tcp_sock.connect(('127.0.0.1', 9002))
+            print("[+] Reconnected to local video TCP 9002", flush=True)
+        except Exception as e:
+            # print("[-] Still cannot connect to 9002: %s" % e, flush=True)
+            return None
+
     try:
-        # Send 4-byte length header followed by NAL
         tcp_sock.sendall(n.to_bytes(4, 'little') + nal)
         _stats['v'] += 1; _stats['vb'] += n
         if n > _stats['vmax']: _stats['vmax'] = n
     except Exception as e:
         print("[-] video TCP send fail %dB: %s" % (n, e), flush=True)
         raise e
+    
+    return tcp_sock
     _maybe_stats()
 
 
@@ -137,7 +148,7 @@ def handle_client(conn, addr, udp_sock, audio_udp_addr):
                             print("[+] Successfully received first video packet via HTTP!")
                             first_video = False
                         if len(payload) > 0:
-                            _fwd_video(video_tcp_sock, payload)
+                            video_tcp_sock = _fwd_video(video_tcp_sock, payload)
                     
                     del buffer[:5+m_len]
             
@@ -189,7 +200,7 @@ def handle_client(conn, addr, udp_sock, audio_udp_addr):
                         first_video = False
                     
                     if len(payload) > 0:
-                            _fwd_video(video_tcp_sock, payload)
+                            video_tcp_sock = _fwd_video(video_tcp_sock, payload)
                         
     except Exception as e:
         print(f"[-] Error handling client: {e}")
@@ -198,7 +209,7 @@ def handle_client(conn, addr, udp_sock, audio_udp_addr):
         # Send remaining video buffer
         if len(video_buffer) > 0:
             try:
-                _fwd_video(video_tcp_sock, video_buffer)
+                video_tcp_sock = _fwd_video(video_tcp_sock, video_buffer)
             except:
                 pass
         if video_tcp_sock:
@@ -236,5 +247,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 

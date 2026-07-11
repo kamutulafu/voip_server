@@ -1,4 +1,4 @@
-// Copyright (c) 2023, Tencent Inc.
+﻿// Copyright (c) 2023, Tencent Inc.
 // All rights reserved.
 #include <fcntl.h>
 #include <pthread.h>
@@ -128,7 +128,7 @@ static wx_error_t voip_init_config(void) {
   config.data_dir = "/data";
   config.h265_only = h265_only;
 
-  /* video_landscape 已废弃，使用 subscribe_video_ratio 来定制宽高比 */
+  /* video_landscape 宸插簾寮冿紝浣跨敤 subscribe_video_ratio 鏉ュ畾鍒跺楂樻瘮 */
   //config.video_landscape = !!landscape;
   config.subscribe_video_length = subscribe_video_length;
   config.subscribe_video_rotation = subscribe_video_rotation;
@@ -155,7 +155,7 @@ static int do_hangup(wx_cloudvoip_hangup_reason_t reason) {
   return 0;
 }
 
-// 定义可接受的选项
+// 瀹氫箟鍙帴鍙楃殑閫夐」
 static struct option long_options[] = {
   {"appid", required_argument, NULL, 'a'},
   {"device_id", required_argument, NULL, 'd'},
@@ -177,9 +177,9 @@ static struct option long_options[] = {
 };
 
 static void run_loop(void) {
-  /* 持续 call_duration 秒后挂断通话 */
+  /* 鎸佺画 call_duration 绉掑悗鎸傛柇閫氳瘽 */
   int ts = 0;
-  while ( voip_status == WX_CLOUDVOIP_SESSION_CALLING || voip_status == WX_CLOUDVOIP_SESSION_TALKING) {
+  while ( voip_status == WX_CLOUDVOIP_SESSION_IDLE || voip_status == WX_CLOUDVOIP_SESSION_CALLING || voip_status == WX_CLOUDVOIP_SESSION_TALKING) {
     usleep(1000*100);
     ts += 100;
     if (ts >= call_duration*1000) {
@@ -189,6 +189,7 @@ static void run_loop(void) {
 }
 
 int main(int argc, char** argv) {
+  setvbuf(stdout, NULL, _IONBF, 0);
   wx_error_t ret = 0;
   wx_operation_t op;
   int opt;  
@@ -272,8 +273,8 @@ int main(int argc, char** argv) {
   }
 
   /*
-   * 演示如何在设备做为 listener 时挂断通话
-   * 手机小程序端使用 wmpfVoip.callDevice 时，设备作为 listener 可以使用 do_hangup 里的代码挂断对方 
+   * 婕旂ず濡備綍鍦ㄨ澶囧仛涓?listener 鏃舵寕鏂€氳瘽
+   * 鎵嬫満灏忕▼搴忕浣跨敤 wmpfVoip.callDevice 鏃讹紝璁惧浣滀负 listener 鍙互浣跨敤 do_hangup 閲岀殑浠ｇ爜鎸傛柇瀵规柟 
    */
   if (listener_hangup_test == 1) {
     do_hangup(WX_CLOUDVOIP_HANGUP_REASON_MANUAL);
@@ -281,8 +282,7 @@ int main(int argc, char** argv) {
   }
 
   /*
-   * 演示如何加入房间。
-   */
+   * 婕旂ず濡備綍鍔犲叆鎴块棿銆?   */
   wx_error_t init_ret = voip_init_config();
   if (init_ret != WXERROR_OK) {
     printf("voip init fail, %d\n", init_ret);
@@ -306,7 +306,7 @@ int main(int argc, char** argv) {
   if (ret != WXERROR_OK) {
     printf("wx_cloudvoip_session_join fail, %d\n", ret);
  
-    /* 这里为什么要挂断一下？？ */
+    /* 杩欓噷涓轰粈涔堣鎸傛柇涓€涓嬶紵锛?*/
     op = wx_cloudvoip_session_hangup(session, WX_CLOUDVOIP_HANGUP_REASON_MANUAL);
     wx_operation_wait(op, 0);
     
@@ -331,3 +331,5 @@ int main(int argc, char** argv) {
   wx_stop();
   return 0;
 }
+
+
