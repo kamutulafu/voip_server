@@ -1,8 +1,12 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 import socket
 import sys
 import threading
 import time
+import struct
+
+active_conn = None
+active_conn_lock = threading.Lock()
 _stats = {'a':0,'ab':0,'v':0,'vb':0,'vmax':0,'vdrop':0,'t':time.time()}
 def _maybe_stats():
     now = time.time()
@@ -53,7 +57,10 @@ def _fwd_video(tcp_sock, nal):
 
 
 def handle_client(conn, addr, udp_sock, audio_udp_addr):
+    global active_conn
     print(f"[+] Client connected from {addr}")
+    with active_conn_lock:
+        active_conn = conn
     video_buffer = bytearray()
     first_audio = True
     first_video = True
@@ -205,6 +212,9 @@ def handle_client(conn, addr, udp_sock, audio_udp_addr):
     except Exception as e:
         print(f"[-] Error handling client: {e}")
     finally:
+        with active_conn_lock:
+            if active_conn == conn:
+                active_conn = None
         conn.close()
         # Send remaining video buffer
         if len(video_buffer) > 0:
@@ -216,7 +226,33 @@ def handle_client(conn, addr, udp_sock, audio_udp_addr):
             video_tcp_sock.close()
         print(f"[-] Client {addr} disconnected.")
 
+def downstream_udp_listener():
+    print("[*] Downstream UDP listener started on port 9004...")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('127.0.0.1', 9004))
+    
+    while True:
+        try:
+            data, addr = sock.recvfrom(4096)
+            if not data:
+                continue
+            
+            with active_conn_lock:
+                if active_conn is not None:
+                    try:
+                        header = struct.pack('<BI', 0, len(data))
+                        active_conn.sendall(header + data)
+                    except Exception as e:
+                        pass
+        except Exception as e:
+            print(f"[-] Downstream UDP listener error: {e}")
+            time.sleep(1)
+
 def main():
+    # Start downstream UDP listener
+    t_down = threading.Thread(target=downstream_udp_listener, daemon=True)
+    t_down.start()
+
     # TCP server for ESP32
     tcp_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

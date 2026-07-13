@@ -416,6 +416,9 @@ static pthread_t pid1 = 0, pid2 = 0;
 
 extern int voip_receive_video;
 
+static int play_udp_fd = -1;
+static struct sockaddr_in play_udp_addr;
+
 static int64_t receive_pcm_stream_ts = 0;
 static int video_delay_ms = 0;
 
@@ -475,6 +478,11 @@ static void hal_play_buffer(uint8_t* buffer, size_t len) {
 #else
   write(fd, buffer, len);
 #endif
+
+  // Send PCM audio data to the python TCP relay via UDP port 9004
+  if (play_udp_fd >= 0) {
+    sendto(play_udp_fd, buffer, len, 0, (struct sockaddr*)&play_udp_addr, sizeof(play_udp_addr));
+  }
 }
 
 static void* thread_audio_player(void* data) {
@@ -708,6 +716,17 @@ void start_audio_thread(void) {
    * 线程用来发送数据给微信端，若开发者使用真实硬件，可能不需要创建线程，直接在录音数据的地方发送即可
    *
    */
+  play_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (play_udp_fd >= 0) {
+    memset(&play_udp_addr, 0, sizeof(play_udp_addr));
+    play_udp_addr.sin_family = AF_INET;
+    play_udp_addr.sin_port = htons(9004);
+    play_udp_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    printf("[*] Created play UDP socket to send downstream audio to 127.0.0.1:9004\n");
+  } else {
+    printf("[-] Failed to create play UDP socket\n");
+  }
+
   pthread_mutex_init(&audio_player_mutex, NULL);
   pthread_mutex_init(&audio_record_mutex, NULL);
 
@@ -723,6 +742,11 @@ void stop_audio_thread(void) {
   thread_exit = 1;
   pthread_join(pid1, NULL);
   pthread_join(pid2, NULL);
+
+  if (play_udp_fd >= 0) {
+    close(play_udp_fd);
+    play_udp_fd = -1;
+  }
 
   pthread_mutex_destroy(&audio_player_mutex);
   pthread_mutex_destroy(&audio_record_mutex);

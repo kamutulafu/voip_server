@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 import socket
 import subprocess
 import sys
@@ -55,6 +55,7 @@ def main():
     try:
         while True:
             conn, addr = server.accept()
+            conn.settimeout(5.0)
             print(f"\n[+] Connection from {addr}")
             try:
                 data_bytes = conn.recv(2048)
