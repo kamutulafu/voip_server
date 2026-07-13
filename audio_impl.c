@@ -562,6 +562,30 @@ static void* thread_audio_player(void* data) {
   return NULL;
 }
 
+/*
+ * 16000Hz mono S16 => 320 samples = 640 bytes per 20ms frame, which is exactly
+ * what the WeChat SDK expects per listener->data() call.
+ */
+#define REC_FRAME_BYTES     (16000 / 1000 * 20 * 2)   /* 640  -> 20ms          */
+#define REC_PREBUFFER_BYTES (REC_FRAME_BYTES * 3)      /* ~60ms before playout  */
+#define REC_MAX_BYTES       (REC_FRAME_BYTES * 25)     /* ~500ms latency cap    */
+
+static void feed_record_frame(const uint8_t* frame, size_t len) {
+  struct timespec ts = {0};
+  struct listnode* node;
+
+  pthread_mutex_lock(&audio_record_mutex);
+  list_for_each(node, &audio_in_stream_list) {
+    AUDIO_STREAMIN* stream = node_to_item(node, AUDIO_STREAMIN, slist);
+    if (stream->config.sample_rate == WX_AUDIO_STREAM_SAMPLE_RATE_16000 &&
+        stream->config.sample_format == WX_SAMPLE_FORMAT_S16) {
+      stream->listener->data(stream->stream_in, stream->user_data, ts,
+                             (uint8_t*)frame, len);
+    }
+  }
+  pthread_mutex_unlock(&audio_record_mutex);
+}
+
 static void* thread_audio_record(void* data) {
   int audio_fd = socket(AF_INET, SOCK_DGRAM, 0);
   if (audio_fd < 0) {
@@ -577,9 +601,13 @@ static void* thread_audio_record(void* data) {
   int reuse = 1;
   setsockopt(audio_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
+  /*
+   * Short receive timeout so the loop wakes often enough to keep a steady 20ms
+   * playout clock instead of feeding the encoder as fast as packets arrive.
+   */
   struct timeval tv;
   tv.tv_sec = 0;
-  tv.tv_usec = 20000; // 20ms timeout
+  tv.tv_usec = 5000; // 5ms
   setsockopt(audio_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
   if (bind(audio_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
@@ -588,33 +616,67 @@ static void* thread_audio_record(void* data) {
     return NULL;
   }
 
-  printf("[*] Audio UDP receiver thread started on 127.0.0.1:9003\n");
+  printf("[*] Audio UDP receiver thread started on 127.0.0.1:9003 (jitter-buffered)\n");
 
-  uint8_t buffer[4096];
+  uint8_t udp_buf[4096];
+
+  /*
+   * Jitter buffer: the device pushes real-time audio over a lossy Wi-Fi/4G TCP
+   * link, so packets reach us in bursts. Feeding those bursts straight into the
+   * WeChat encoder makes the far end (mini-program) hear crackle / static. We
+   * accumulate incoming PCM here and hand the encoder exactly one 640-byte
+   * frame every 20ms.
+   */
+  static uint8_t jbuf[REC_MAX_BYTES + 4096];
+  size_t   jlen = 0;         // valid bytes in jbuf
+  int      feeding = 0;      // started playout after prebuffer filled?
+  int64_t  next_feed_us = 0; // wall-clock time of the next frame to feed
 
   while (!thread_exit) {
-    if (voip_status == WX_CLOUDVOIP_SESSION_TALKING) {
-      struct timespec ts = {0};
-      ssize_t sz = recvfrom(audio_fd, buffer, sizeof(buffer), 0, NULL, NULL);
-      if (sz > 0) {
-        pthread_mutex_lock(&audio_record_mutex);
-
-        struct listnode* node;
-        list_for_each(node, &audio_in_stream_list) {
-          AUDIO_STREAMIN* stream = node_to_item(node, AUDIO_STREAMIN, slist);
-
-          if (stream->config.sample_rate == WX_AUDIO_STREAM_SAMPLE_RATE_16000 &&
-              stream->config.sample_format == WX_SAMPLE_FORMAT_S16) {
-            stream->listener->data(stream->stream_in, stream->user_data, ts,
-                                   buffer, sz);
-          }
-        }
-
-        pthread_mutex_unlock(&audio_record_mutex);
-      }
-    }
-    else {
+    if (voip_status != WX_CLOUDVOIP_SESSION_TALKING) {
+      // Drop buffered audio between calls so a new call starts clean.
+      jlen = 0;
+      feeding = 0;
       usleep(10000);
+      continue;
+    }
+
+    /* 1) Pull whatever is available into the jitter buffer. */
+    ssize_t sz = recvfrom(audio_fd, udp_buf, sizeof(udp_buf), 0, NULL, NULL);
+    if (sz > 0) {
+      if (jlen + (size_t)sz > REC_MAX_BYTES) {
+        /* Bound latency: drop oldest whole frames to keep S16 alignment. */
+        size_t overflow = jlen + (size_t)sz - REC_MAX_BYTES;
+        overflow = ((overflow + REC_FRAME_BYTES - 1) / REC_FRAME_BYTES) * REC_FRAME_BYTES;
+        if (overflow > jlen) {
+          overflow = jlen;
+        }
+        memmove(jbuf, jbuf + overflow, jlen - overflow);
+        jlen -= overflow;
+        printf("[!] audio jitter buffer overflow, dropped %zu bytes\n", overflow);
+      }
+      memcpy(jbuf + jlen, udp_buf, (size_t)sz);
+      jlen += (size_t)sz;
+    }
+
+    /* 2) Wait for a small prebuffer before starting steady playout. */
+    int64_t now = get_timestamp_us();
+    if (!feeding && jlen >= REC_PREBUFFER_BYTES) {
+      feeding = 1;
+      next_feed_us = now;
+    }
+
+    /* 3) Feed one frame per 20ms tick (catching up if we fell behind). */
+    while (feeding && now >= next_feed_us) {
+      if (jlen < REC_FRAME_BYTES) {
+        /* Underrun: pause and rebuild the prebuffer to avoid choppy audio. */
+        feeding = 0;
+        break;
+      }
+      feed_record_frame(jbuf, REC_FRAME_BYTES);
+      memmove(jbuf, jbuf + REC_FRAME_BYTES, jlen - REC_FRAME_BYTES);
+      jlen -= REC_FRAME_BYTES;
+      next_feed_us += 20000;
     }
   }
 

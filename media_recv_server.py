@@ -57,10 +57,13 @@ def _fwd_video(tcp_sock, nal):
 
 
 def handle_client(conn, addr, udp_sock, audio_udp_addr):
-    global active_conn
+    global active_conn, audio_out_buffer
     print(f"[+] Client connected from {addr}")
     with active_conn_lock:
         active_conn = conn
+    # Reset the re-framing buffer so leftover bytes from a previous call cannot
+    # bleed into (and mis-align) the new call's audio.
+    del audio_out_buffer[:]
     video_buffer = bytearray()
     first_audio = True
     first_video = True
